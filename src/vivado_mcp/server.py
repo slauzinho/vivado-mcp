@@ -15,7 +15,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from vivado_mcp.config import VivadoConfig
-from vivado_mcp.vivado.build import run_vivado_build
+from vivado_mcp.vivado.build import get_build_status, run_vivado_build
 from vivado_mcp.vivado.clean import clean_build_outputs
 from vivado_mcp.vivado.detection import (
     VivadoInstallation,
@@ -135,6 +135,29 @@ async def list_tools() -> list[Tool]:
                 "required": ["project_path"],
             },
         ),
+        Tool(
+            name="get_build_status",
+            description=(
+                "Check if a previous Vivado build completed successfully. "
+                "Reads Vivado run status from the .runs directory to determine "
+                "the current build state. Returns the overall state (not_started, "
+                "in_progress, completed, failed) along with synthesis and implementation "
+                "run details. Includes timestamp of last build attempt if available."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": (
+                            "Path to the Vivado project file (.xpr) or project directory. "
+                            "The .runs directory in the same folder will be checked for status."
+                        ),
+                    },
+                },
+                "required": ["project_path"],
+            },
+        ),
     ]
 
 
@@ -147,6 +170,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _handle_run_build(arguments)
     if name == "clean_build":
         return await _handle_clean_build(arguments)
+    if name == "get_build_status":
+        return await _handle_get_build_status(arguments)
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -327,6 +352,32 @@ async def _handle_clean_build(arguments: dict[str, Any]) -> Sequence[TextContent
     clean_result = clean_build_outputs(project_path=project_path)
 
     return [TextContent(type="text", text=json.dumps(clean_result.to_dict(), indent=2))]
+
+
+async def _handle_get_build_status(arguments: dict[str, Any]) -> Sequence[TextContent]:
+    """Handle the get_build_status tool call.
+
+    Args:
+        arguments: Tool arguments containing 'project_path' field
+
+    Returns:
+        List of TextContent with build status information
+    """
+    import json
+
+    project_path: str | None = arguments.get("project_path")
+
+    # Validate required arguments
+    if not project_path:
+        result = {
+            "error": "Missing required argument: project_path",
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    # Get the build status
+    status = get_build_status(project_path=project_path)
+
+    return [TextContent(type="text", text=json.dumps(status.to_dict(), indent=2))]
 
 
 async def run_server() -> None:

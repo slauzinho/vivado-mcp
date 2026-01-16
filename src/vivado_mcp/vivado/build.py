@@ -1,7 +1,8 @@
 """Vivado build execution module.
 
 This module provides functionality to run complete Vivado build flows
-(synthesis -> implementation -> bitstream) in batch mode.
+(synthesis -> implementation -> bitstream) in batch mode, and to check
+the status of previous builds.
 """
 
 from __future__ import annotations
@@ -11,9 +12,64 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
 from pathlib import Path
 
 from vivado_mcp.vivado.detection import VivadoInstallation, get_default_vivado
+
+
+class BuildState(str, Enum):
+    """Represents the current state of a Vivado build."""
+
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass
+class RunStatus:
+    """Represents the status of a single Vivado run (synth_1, impl_1, etc.)."""
+
+    name: str
+    state: BuildState
+    progress: str | None = None  # e.g., "100%"
+    status_message: str | None = None  # e.g., "synth_design Complete!"
+    timestamp: str | None = None
+
+    def to_dict(self) -> dict[str, str | None]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "progress": self.progress,
+            "status_message": self.status_message,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class BuildStatus:
+    """Represents the overall build status of a Vivado project."""
+
+    project_path: str
+    overall_state: BuildState
+    synthesis: RunStatus | None = None
+    implementation: RunStatus | None = None
+    last_build_timestamp: str | None = None
+    runs_directory_exists: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "project_path": self.project_path,
+            "overall_state": self.overall_state.value,
+            "synthesis": self.synthesis.to_dict() if self.synthesis else None,
+            "implementation": self.implementation.to_dict() if self.implementation else None,
+            "last_build_timestamp": self.last_build_timestamp,
+            "runs_directory_exists": self.runs_directory_exists,
+        }
 
 
 @dataclass
@@ -365,3 +421,260 @@ async def run_vivado_build(
             os.unlink(tcl_path)
         except OSError:
             pass
+
+
+def _get_run_directory_timestamp(run_dir: Path) -> str | None:
+    """Get the most recent modification timestamp from a run directory.
+
+    Args:
+        run_dir: Path to the run directory (e.g., synth_1, impl_1)
+
+    Returns:
+        ISO format timestamp string or None if cannot be determined
+    """
+    try:
+        # Look for common status files in the run directory
+        status_files = [
+            run_dir / "runme.log",
+            run_dir / "vivado.pb",
+            run_dir / ".vivado.begin.rst",
+            run_dir / ".vivado.end.rst",
+        ]
+
+        most_recent: float | None = None
+        for status_file in status_files:
+            if status_file.exists():
+                mtime = status_file.stat().st_mtime
+                if most_recent is None or mtime > most_recent:
+                    most_recent = mtime
+
+        # If no status files found, use the directory mtime
+        if most_recent is None and run_dir.exists():
+            most_recent = run_dir.stat().st_mtime
+
+        if most_recent is not None:
+            return datetime.fromtimestamp(most_recent).isoformat()
+
+    except OSError:
+        pass
+
+    return None
+
+
+def _parse_run_status(run_dir: Path, run_name: str) -> RunStatus:
+    """Parse the status of a Vivado run from its directory.
+
+    Vivado stores run status in several ways:
+    - .vivado.begin.rst / .vivado.end.rst markers
+    - runme.log for detailed progress
+    - vivado.pb for progress information
+
+    Args:
+        run_dir: Path to the run directory
+        run_name: Name of the run (e.g., "synth_1")
+
+    Returns:
+        RunStatus object with current state
+    """
+    if not run_dir.exists():
+        return RunStatus(
+            name=run_name,
+            state=BuildState.NOT_STARTED,
+        )
+
+    timestamp = _get_run_directory_timestamp(run_dir)
+
+    # Check for begin/end markers
+    begin_marker = run_dir / ".vivado.begin.rst"
+    end_marker = run_dir / ".vivado.end.rst"
+    error_marker = run_dir / ".vivado.error.rst"
+
+    # Check runme.log for detailed status
+    runme_log = run_dir / "runme.log"
+    progress: str | None = None
+    status_message: str | None = None
+
+    if runme_log.exists():
+        try:
+            log_content = runme_log.read_text(errors="replace")
+
+            # Look for progress indicators
+            # Vivado logs "Progress: X%" during runs
+            progress_matches = re.findall(r"Progress:\s*(\d+%)", log_content)
+            if progress_matches:
+                progress = progress_matches[-1]  # Get the most recent progress
+
+            # Look for completion status
+            if "synth_design Complete!" in log_content:
+                status_message = "synth_design Complete!"
+            elif "place_design Complete!" in log_content:
+                status_message = "place_design Complete!"
+            elif "route_design Complete!" in log_content:
+                status_message = "route_design Complete!"
+            elif "write_bitstream Complete!" in log_content:
+                status_message = "write_bitstream Complete!"
+            elif "Implementation successful" in log_content:
+                status_message = "Implementation successful"
+            elif "Synthesis successful" in log_content:
+                status_message = "Synthesis successful"
+
+            # Check for error conditions
+            if re.search(r"ERROR:\s*\[", log_content):
+                return RunStatus(
+                    name=run_name,
+                    state=BuildState.FAILED,
+                    progress=progress,
+                    status_message="Build failed with errors",
+                    timestamp=timestamp,
+                )
+
+        except OSError:
+            pass
+
+    # Determine state based on markers and log content
+    if error_marker.exists():
+        return RunStatus(
+            name=run_name,
+            state=BuildState.FAILED,
+            progress=progress,
+            status_message=status_message or "Build failed",
+            timestamp=timestamp,
+        )
+
+    if end_marker.exists():
+        # Run completed (may be success or failure)
+        if status_message and "Complete" in status_message:
+            return RunStatus(
+                name=run_name,
+                state=BuildState.COMPLETED,
+                progress="100%",
+                status_message=status_message,
+                timestamp=timestamp,
+            )
+        # Check if there's a bitstream file for impl runs
+        if run_name.startswith("impl"):
+            bit_files = list(run_dir.glob("*.bit"))
+            if bit_files:
+                return RunStatus(
+                    name=run_name,
+                    state=BuildState.COMPLETED,
+                    progress="100%",
+                    status_message="Bitstream generated",
+                    timestamp=timestamp,
+                )
+        return RunStatus(
+            name=run_name,
+            state=BuildState.COMPLETED,
+            progress=progress or "100%",
+            status_message=status_message,
+            timestamp=timestamp,
+        )
+
+    if begin_marker.exists() and not end_marker.exists():
+        return RunStatus(
+            name=run_name,
+            state=BuildState.IN_PROGRESS,
+            progress=progress,
+            status_message=status_message or "Build in progress",
+            timestamp=timestamp,
+        )
+
+    # If we have some files but no markers, it might be an incomplete or old run
+    if runme_log.exists():
+        return RunStatus(
+            name=run_name,
+            state=BuildState.FAILED,
+            progress=progress,
+            status_message="Run incomplete or interrupted",
+            timestamp=timestamp,
+        )
+
+    return RunStatus(
+        name=run_name,
+        state=BuildState.NOT_STARTED,
+        timestamp=timestamp,
+    )
+
+
+def get_build_status(project_path: str | Path) -> BuildStatus:
+    """Get the current build status of a Vivado project.
+
+    Reads Vivado run status from the .runs directory to determine if
+    a previous build completed successfully, is in progress, or failed.
+
+    Args:
+        project_path: Path to the Vivado project file (.xpr) or project directory
+
+    Returns:
+        BuildStatus object containing the overall state and individual run statuses
+    """
+    path = Path(project_path)
+
+    # If it's a file, use the parent directory
+    if path.is_file():
+        project_dir = path.parent
+    else:
+        project_dir = path
+
+    # Find the project name for the runs directory
+    # Vivado creates runs directories like: <project_name>.runs/
+    runs_dir: Path | None = None
+
+    # First try to find .xpr file to get exact project name
+    xpr_files = list(project_dir.glob("*.xpr"))
+    if xpr_files:
+        project_name = xpr_files[0].stem
+        runs_dir = project_dir / f"{project_name}.runs"
+
+    # Fallback: look for any .runs directory
+    if runs_dir is None or not runs_dir.exists():
+        runs_dirs = list(project_dir.glob("*.runs"))
+        if runs_dirs:
+            runs_dir = runs_dirs[0]
+
+    # If no runs directory exists, build hasn't been started
+    if runs_dir is None or not runs_dir.exists():
+        return BuildStatus(
+            project_path=str(project_path),
+            overall_state=BuildState.NOT_STARTED,
+            runs_directory_exists=False,
+        )
+
+    # Parse synthesis run status
+    synth_dir = runs_dir / "synth_1"
+    synth_status = _parse_run_status(synth_dir, "synth_1")
+
+    # Parse implementation run status
+    impl_dir = runs_dir / "impl_1"
+    impl_status = _parse_run_status(impl_dir, "impl_1")
+
+    # Get the most recent timestamp
+    timestamps = [
+        synth_status.timestamp,
+        impl_status.timestamp,
+    ]
+    valid_timestamps = [t for t in timestamps if t is not None]
+    last_timestamp = max(valid_timestamps) if valid_timestamps else None
+
+    # Determine overall state
+    # Priority: in_progress > failed > completed > not_started
+    if synth_status.state == BuildState.IN_PROGRESS or impl_status.state == BuildState.IN_PROGRESS:
+        overall_state = BuildState.IN_PROGRESS
+    elif synth_status.state == BuildState.FAILED or impl_status.state == BuildState.FAILED:
+        overall_state = BuildState.FAILED
+    elif impl_status.state == BuildState.COMPLETED:
+        overall_state = BuildState.COMPLETED
+    elif synth_status.state == BuildState.COMPLETED:
+        # Synthesis done but implementation not complete
+        overall_state = BuildState.COMPLETED
+    else:
+        overall_state = BuildState.NOT_STARTED
+
+    return BuildStatus(
+        project_path=str(project_path),
+        overall_state=overall_state,
+        synthesis=synth_status,
+        implementation=impl_status,
+        last_build_timestamp=last_timestamp,
+        runs_directory_exists=True,
+    )

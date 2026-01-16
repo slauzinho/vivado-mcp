@@ -11,8 +11,14 @@ import pytest
 from vivado_mcp.vivado.build import (
     BuildMessage,
     BuildResult,
+    BuildState,
+    BuildStatus,
+    RunStatus,
     _generate_build_tcl,
+    _get_run_directory_timestamp,
+    _parse_run_status,
     _validate_project_path,
+    get_build_status,
     parse_vivado_output,
     run_vivado_build,
 )
@@ -418,3 +424,342 @@ class TestRunVivadoBuild:
             # Check no GUI flags
             assert "-nojournal" in call_args
             assert "-nolog" in call_args
+
+
+class TestRunStatus:
+    """Tests for RunStatus dataclass."""
+
+    def test_to_dict_basic(self) -> None:
+        status = RunStatus(
+            name="synth_1",
+            state=BuildState.COMPLETED,
+        )
+        result = status.to_dict()
+        assert result["name"] == "synth_1"
+        assert result["state"] == "completed"
+        assert result["progress"] is None
+        assert result["status_message"] is None
+        assert result["timestamp"] is None
+
+    def test_to_dict_with_all_fields(self) -> None:
+        status = RunStatus(
+            name="impl_1",
+            state=BuildState.IN_PROGRESS,
+            progress="75%",
+            status_message="place_design in progress",
+            timestamp="2024-01-15T10:30:00",
+        )
+        result = status.to_dict()
+        assert result["name"] == "impl_1"
+        assert result["state"] == "in_progress"
+        assert result["progress"] == "75%"
+        assert result["status_message"] == "place_design in progress"
+        assert result["timestamp"] == "2024-01-15T10:30:00"
+
+
+class TestBuildStatus:
+    """Tests for BuildStatus dataclass."""
+
+    def test_to_dict_no_runs(self) -> None:
+        status = BuildStatus(
+            project_path="/path/to/project.xpr",
+            overall_state=BuildState.NOT_STARTED,
+            runs_directory_exists=False,
+        )
+        result = status.to_dict()
+        assert result["project_path"] == "/path/to/project.xpr"
+        assert result["overall_state"] == "not_started"
+        assert result["synthesis"] is None
+        assert result["implementation"] is None
+        assert result["last_build_timestamp"] is None
+        assert result["runs_directory_exists"] is False
+
+    def test_to_dict_with_runs(self) -> None:
+        synth = RunStatus(
+            name="synth_1",
+            state=BuildState.COMPLETED,
+            progress="100%",
+            status_message="synth_design Complete!",
+        )
+        impl = RunStatus(
+            name="impl_1",
+            state=BuildState.COMPLETED,
+            progress="100%",
+            status_message="write_bitstream Complete!",
+        )
+        status = BuildStatus(
+            project_path="/path/to/project.xpr",
+            overall_state=BuildState.COMPLETED,
+            synthesis=synth,
+            implementation=impl,
+            last_build_timestamp="2024-01-15T12:00:00",
+            runs_directory_exists=True,
+        )
+        result = status.to_dict()
+        assert result["overall_state"] == "completed"
+        assert result["synthesis"] is not None
+        assert result["implementation"] is not None
+        assert result["last_build_timestamp"] == "2024-01-15T12:00:00"
+
+
+class TestGetRunDirectoryTimestamp:
+    """Tests for _get_run_directory_timestamp function."""
+
+    def test_nonexistent_directory(self, tmp_path: Path) -> None:
+        result = _get_run_directory_timestamp(tmp_path / "nonexistent")
+        assert result is None
+
+    def test_empty_directory(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "synth_1"
+        run_dir.mkdir()
+        result = _get_run_directory_timestamp(run_dir)
+        # Should return directory mtime
+        assert result is not None
+
+    def test_with_log_file(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "synth_1"
+        run_dir.mkdir()
+        log_file = run_dir / "runme.log"
+        log_file.write_text("Build log content")
+        result = _get_run_directory_timestamp(run_dir)
+        assert result is not None
+
+
+class TestParseRunStatus:
+    """Tests for _parse_run_status function."""
+
+    def test_nonexistent_directory(self, tmp_path: Path) -> None:
+        result = _parse_run_status(tmp_path / "nonexistent", "synth_1")
+        assert result.name == "synth_1"
+        assert result.state == BuildState.NOT_STARTED
+
+    def test_empty_directory(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "synth_1"
+        run_dir.mkdir()
+        result = _parse_run_status(run_dir, "synth_1")
+        assert result.state == BuildState.NOT_STARTED
+
+    def test_in_progress_with_begin_marker(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "synth_1"
+        run_dir.mkdir()
+        (run_dir / ".vivado.begin.rst").touch()
+        result = _parse_run_status(run_dir, "synth_1")
+        assert result.state == BuildState.IN_PROGRESS
+
+    def test_completed_with_end_marker(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "synth_1"
+        run_dir.mkdir()
+        (run_dir / ".vivado.begin.rst").touch()
+        (run_dir / ".vivado.end.rst").touch()
+        result = _parse_run_status(run_dir, "synth_1")
+        assert result.state == BuildState.COMPLETED
+
+    def test_failed_with_error_marker(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "synth_1"
+        run_dir.mkdir()
+        (run_dir / ".vivado.begin.rst").touch()
+        (run_dir / ".vivado.error.rst").touch()
+        result = _parse_run_status(run_dir, "synth_1")
+        assert result.state == BuildState.FAILED
+
+    def test_completed_with_log_success(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "synth_1"
+        run_dir.mkdir()
+        (run_dir / ".vivado.begin.rst").touch()
+        (run_dir / ".vivado.end.rst").touch()
+        log_file = run_dir / "runme.log"
+        log_file.write_text("Some output\nsynth_design Complete!\nMore output")
+        result = _parse_run_status(run_dir, "synth_1")
+        assert result.state == BuildState.COMPLETED
+        assert result.status_message == "synth_design Complete!"
+
+    def test_failed_with_error_in_log(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "synth_1"
+        run_dir.mkdir()
+        log_file = run_dir / "runme.log"
+        log_file.write_text("ERROR: [Synth 8-87] Signal not found")
+        result = _parse_run_status(run_dir, "synth_1")
+        assert result.state == BuildState.FAILED
+        assert result.status_message == "Build failed with errors"
+
+    def test_progress_parsing(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "impl_1"
+        run_dir.mkdir()
+        (run_dir / ".vivado.begin.rst").touch()
+        log_file = run_dir / "runme.log"
+        log_file.write_text("Progress: 25%\nProgress: 50%\nProgress: 75%\n")
+        result = _parse_run_status(run_dir, "impl_1")
+        assert result.state == BuildState.IN_PROGRESS
+        assert result.progress == "75%"
+
+    def test_impl_completed_with_bitstream(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "impl_1"
+        run_dir.mkdir()
+        (run_dir / ".vivado.begin.rst").touch()
+        (run_dir / ".vivado.end.rst").touch()
+        (run_dir / "design.bit").touch()  # Bitstream file
+        result = _parse_run_status(run_dir, "impl_1")
+        assert result.state == BuildState.COMPLETED
+        assert result.status_message == "Bitstream generated"
+
+    def test_incomplete_run_with_log_only(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "synth_1"
+        run_dir.mkdir()
+        log_file = run_dir / "runme.log"
+        log_file.write_text("Starting synthesis...")
+        result = _parse_run_status(run_dir, "synth_1")
+        assert result.state == BuildState.FAILED
+        assert result.status_message == "Run incomplete or interrupted"
+
+
+class TestGetBuildStatus:
+    """Tests for get_build_status function."""
+
+    def test_no_runs_directory(self, tmp_path: Path) -> None:
+        project = tmp_path / "project.xpr"
+        project.touch()
+        result = get_build_status(project)
+        assert result.overall_state == BuildState.NOT_STARTED
+        assert result.runs_directory_exists is False
+        assert result.synthesis is None
+        assert result.implementation is None
+
+    def test_with_directory_path(self, tmp_path: Path) -> None:
+        # Test passing a directory instead of a file
+        result = get_build_status(tmp_path)
+        assert result.overall_state == BuildState.NOT_STARTED
+        assert result.runs_directory_exists is False
+
+    def test_runs_directory_exists_no_runs(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        result = get_build_status(project)
+        assert result.runs_directory_exists is True
+        assert result.synthesis is not None
+        assert result.synthesis.state == BuildState.NOT_STARTED
+
+    def test_synthesis_in_progress(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+
+        result = get_build_status(project)
+        assert result.overall_state == BuildState.IN_PROGRESS
+        assert result.synthesis is not None
+        assert result.synthesis.state == BuildState.IN_PROGRESS
+
+    def test_synthesis_completed_impl_not_started(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+
+        result = get_build_status(project)
+        assert result.overall_state == BuildState.COMPLETED
+        assert result.synthesis is not None
+        assert result.synthesis.state == BuildState.COMPLETED
+        assert result.implementation is not None
+        assert result.implementation.state == BuildState.NOT_STARTED
+
+    def test_full_build_completed(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+
+        # Synthesis complete
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+        (synth_dir / "runme.log").write_text("synth_design Complete!")
+
+        # Implementation complete
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+        (impl_dir / ".vivado.begin.rst").touch()
+        (impl_dir / ".vivado.end.rst").touch()
+        (impl_dir / "design.bit").touch()
+
+        result = get_build_status(project)
+        assert result.overall_state == BuildState.COMPLETED
+        assert result.synthesis is not None
+        assert result.synthesis.state == BuildState.COMPLETED
+        assert result.implementation is not None
+        assert result.implementation.state == BuildState.COMPLETED
+
+    def test_synthesis_failed(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.error.rst").touch()
+
+        result = get_build_status(project)
+        assert result.overall_state == BuildState.FAILED
+        assert result.synthesis is not None
+        assert result.synthesis.state == BuildState.FAILED
+
+    def test_implementation_failed(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+
+        # Synthesis complete
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+
+        # Implementation failed
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+        (impl_dir / "runme.log").write_text("ERROR: [Place 30-876] Placement failed")
+
+        result = get_build_status(project)
+        assert result.overall_state == BuildState.FAILED
+        assert result.implementation is not None
+        assert result.implementation.state == BuildState.FAILED
+
+    def test_finds_runs_dir_by_glob(self, tmp_path: Path) -> None:
+        # Test finding .runs directory when project name differs
+        runs_dir = tmp_path / "different_name.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+
+        result = get_build_status(tmp_path)
+        assert result.runs_directory_exists is True
+        assert result.synthesis is not None
+        assert result.synthesis.state == BuildState.COMPLETED
+
+    def test_timestamp_returned(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+        (synth_dir / "runme.log").write_text("Build log")
+
+        result = get_build_status(project)
+        assert result.last_build_timestamp is not None
