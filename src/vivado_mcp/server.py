@@ -15,6 +15,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from vivado_mcp.config import VivadoConfig
+from vivado_mcp.vivado.build import run_vivado_build
 from vivado_mcp.vivado.detection import (
     VivadoInstallation,
     detect_vivado_installations,
@@ -72,6 +73,44 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="run_build",
+            description=(
+                "Run a complete Vivado build flow (synthesis -> implementation -> bitstream). "
+                "Executes Vivado in batch mode with no GUI. "
+                "The build stops immediately on the first error. "
+                "Returns success/failure status with any errors or critical warnings. "
+                "Uses auto-detected Vivado installation unless a specific version is requested."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": (
+                            "Path to the Vivado project file (.xpr) or TCL build script (.tcl). "
+                            "For .xpr files, runs synth_1 and impl_1 design runs. "
+                            "For .tcl files, sources the script and runs synth/impl/bitstream."
+                        ),
+                    },
+                    "vivado_version": {
+                        "type": "string",
+                        "description": (
+                            "Optional specific Vivado version to use (e.g., '2023.2'). "
+                            "If not provided, uses the auto-detected default installation."
+                        ),
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": (
+                            "Optional timeout in seconds for the build process. "
+                            "If not provided, the build runs until completion or error."
+                        ),
+                    },
+                },
+                "required": ["project_path"],
+            },
+        ),
     ]
 
 
@@ -80,6 +119,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
     """Handle tool calls."""
     if name == "detect_vivado":
         return await _handle_detect_vivado(arguments)
+    if name == "run_build":
+        return await _handle_run_build(arguments)
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -179,6 +220,60 @@ async def _handle_detect_vivado(arguments: dict[str, Any]) -> Sequence[TextConte
                 "searched_version": requested_version,
             }
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+async def _handle_run_build(arguments: dict[str, Any]) -> Sequence[TextContent]:
+    """Handle the run_build tool call.
+
+    Args:
+        arguments: Tool arguments containing 'project_path' and optional
+                  'vivado_version' and 'timeout' fields
+
+    Returns:
+        List of TextContent with build results
+    """
+    import json
+
+    project_path: str | None = arguments.get("project_path")
+    vivado_version: str | None = arguments.get("vivado_version")
+    timeout: int | None = arguments.get("timeout")
+
+    # Validate required arguments
+    if not project_path:
+        result = {
+            "success": False,
+            "error": "Missing required argument: project_path",
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    # Get Vivado installation
+    vivado_install: VivadoInstallation | None = None
+    if vivado_version:
+        vivado_install = get_default_vivado(override_version=vivado_version)
+        if vivado_install is None:
+            result = {
+                "success": False,
+                "error": f"Requested Vivado version '{vivado_version}' not found",
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+    else:
+        # Use auto-detected installation
+        config = get_config()
+        if config.vivado_path:
+            vivado_install = get_default_vivado(override_path=config.vivado_path)
+        elif config.vivado_version:
+            vivado_install = get_default_vivado(override_version=config.vivado_version)
+        else:
+            vivado_install = get_default_vivado()
+
+    # Run the build
+    build_result = await run_vivado_build(
+        project_path=project_path,
+        vivado_install=vivado_install,
+        timeout=timeout,
+    )
+
+    return [TextContent(type="text", text=json.dumps(build_result.to_dict(), indent=2))]
 
 
 async def run_server() -> None:
