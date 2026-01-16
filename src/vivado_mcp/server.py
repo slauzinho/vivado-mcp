@@ -16,6 +16,7 @@ from mcp.types import TextContent, Tool
 
 from vivado_mcp.config import VivadoConfig
 from vivado_mcp.vivado.build import run_vivado_build
+from vivado_mcp.vivado.clean import clean_build_outputs
 from vivado_mcp.vivado.detection import (
     VivadoInstallation,
     detect_vivado_installations,
@@ -111,6 +112,29 @@ async def list_tools() -> list[Tool]:
                 "required": ["project_path"],
             },
         ),
+        Tool(
+            name="clean_build",
+            description=(
+                "Clean Vivado build output directories to allow fresh rebuilds. "
+                "Removes default Vivado output directories (.runs/, .cache/, .gen/, "
+                ".hw/, .ip_user_files/) while preserving source files, constraints, "
+                "and project configuration. "
+                "Returns confirmation of cleaned directories."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": (
+                            "Path to the Vivado project file (.xpr) or project directory. "
+                            "The output directories in the same folder will be cleaned."
+                        ),
+                    },
+                },
+                "required": ["project_path"],
+            },
+        ),
     ]
 
 
@@ -121,6 +145,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _handle_detect_vivado(arguments)
     if name == "run_build":
         return await _handle_run_build(arguments)
+    if name == "clean_build":
+        return await _handle_clean_build(arguments)
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -274,6 +300,33 @@ async def _handle_run_build(arguments: dict[str, Any]) -> Sequence[TextContent]:
     )
 
     return [TextContent(type="text", text=json.dumps(build_result.to_dict(), indent=2))]
+
+
+async def _handle_clean_build(arguments: dict[str, Any]) -> Sequence[TextContent]:
+    """Handle the clean_build tool call.
+
+    Args:
+        arguments: Tool arguments containing 'project_path' field
+
+    Returns:
+        List of TextContent with clean results
+    """
+    import json
+
+    project_path: str | None = arguments.get("project_path")
+
+    # Validate required arguments
+    if not project_path:
+        result = {
+            "success": False,
+            "error": "Missing required argument: project_path",
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    # Clean the build outputs
+    clean_result = clean_build_outputs(project_path=project_path)
+
+    return [TextContent(type="text", text=json.dumps(clean_result.to_dict(), indent=2))]
 
 
 async def run_server() -> None:
