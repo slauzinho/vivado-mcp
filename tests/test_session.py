@@ -10,15 +10,88 @@ import pytest
 
 from vivado_mcp.vivado.detection import VivadoInstallation
 from vivado_mcp.vivado.session import (
+    MAX_OUTPUT_SIZE,
     SessionInfo,
     SessionManager,
     SessionState,
     TclCommandResult,
     TclSession,
+    TruncationResult,
     _run_batch_command,
     get_session_manager,
     run_tcl_command_with_fallback,
+    truncate_output,
 )
+
+
+class TestTruncateOutput:
+    """Tests for the truncate_output function."""
+
+    def test_small_output_not_truncated(self) -> None:
+        """Small outputs should pass through unchanged."""
+        output = "Hello, world!"
+        result = truncate_output(output, save_full=False)
+        assert result.truncated_output == output
+        assert result.was_truncated is False
+        assert result.full_output_file is None
+
+    def test_exact_limit_not_truncated(self) -> None:
+        """Output at exactly the limit should not be truncated."""
+        output = "x" * MAX_OUTPUT_SIZE
+        result = truncate_output(output, save_full=False)
+        assert result.truncated_output == output
+        assert result.was_truncated is False
+        assert result.full_output_file is None
+
+    def test_large_output_truncated(self) -> None:
+        """Large outputs should be truncated with a message."""
+        output = "x" * (MAX_OUTPUT_SIZE + 1000)
+        result = truncate_output(output, save_full=False)
+        assert result.was_truncated is True
+        assert len(result.truncated_output) < len(output)
+        assert "OUTPUT TRUNCATED" in result.truncated_output
+        assert f"{len(output):,} characters total" in result.truncated_output
+
+    def test_truncation_preserves_start_and_end(self) -> None:
+        """Truncation should preserve content from both start and end."""
+        start_marker = "START_MARKER_12345"
+        end_marker = "END_MARKER_67890"
+        middle = "x" * (MAX_OUTPUT_SIZE + 5000)
+        output = start_marker + middle + end_marker
+
+        result = truncate_output(output, save_full=False)
+        assert result.was_truncated is True
+        assert start_marker in result.truncated_output
+        assert end_marker in result.truncated_output
+
+    def test_custom_max_size(self) -> None:
+        """Custom max_size should be respected."""
+        output = "x" * 1000
+        result = truncate_output(output, max_size=500, save_full=False)
+        assert result.was_truncated is True
+        assert len(result.truncated_output) < len(output)
+
+    def test_large_output_saves_to_file(self) -> None:
+        """Large outputs should be saved to a file when save_full=True."""
+        output = "x" * (MAX_OUTPUT_SIZE + 1000)
+        result = truncate_output(output, save_full=True)
+        assert result.was_truncated is True
+        assert result.full_output_file is not None
+        # Verify the file exists and contains the full output
+        file_path = Path(result.full_output_file)
+        assert file_path.exists()
+        assert file_path.read_text() == output
+        # Cleanup
+        file_path.unlink()
+
+    def test_truncation_message_includes_file_path(self) -> None:
+        """Truncation message should include the file path when saved."""
+        output = "x" * (MAX_OUTPUT_SIZE + 1000)
+        result = truncate_output(output, save_full=True)
+        assert result.full_output_file is not None
+        assert result.full_output_file in result.truncated_output
+        # Cleanup
+        Path(result.full_output_file).unlink()
 
 
 class TestTclCommandResult:
@@ -35,6 +108,7 @@ class TestTclCommandResult:
         assert d["success"] is True
         assert d["command"] == "puts hello"
         assert d["output"] == "hello"
+        assert d["output_truncated"] is False
         assert d["errors"] == []
         assert d["critical_warnings"] == []
         assert d["error_count"] == 0
@@ -57,8 +131,40 @@ class TestTclCommandResult:
         )
         d = result.to_dict()
         assert d["success"] is False
+        assert d["output_truncated"] is False
         assert d["error_count"] == 1
         assert len(d["errors"]) == 1  # type: ignore[arg-type]
+
+    def test_to_dict_large_output_truncated(self) -> None:
+        """Large outputs should be truncated in to_dict() with file saved."""
+        large_output = "x" * (MAX_OUTPUT_SIZE + 5000)
+        result = TclCommandResult(
+            success=True,
+            command="get_cells",
+            output=large_output,
+        )
+        d = result.to_dict()
+        assert d["output_truncated"] is True
+        assert len(d["output"]) < len(large_output)  # type: ignore[arg-type]
+        assert "OUTPUT TRUNCATED" in d["output"]  # type: ignore[operator]
+        # Verify file was created with full output
+        assert "full_output_file" in d
+        file_path = Path(d["full_output_file"])  # type: ignore[arg-type]
+        assert file_path.exists()
+        assert file_path.read_text() == large_output
+        # Cleanup
+        file_path.unlink()
+
+    def test_to_dict_small_output_no_file(self) -> None:
+        """Small outputs should not create a file."""
+        result = TclCommandResult(
+            success=True,
+            command="puts hello",
+            output="hello",
+        )
+        d = result.to_dict()
+        assert d["output_truncated"] is False
+        assert "full_output_file" not in d
 
 
 class TestSessionInfo:

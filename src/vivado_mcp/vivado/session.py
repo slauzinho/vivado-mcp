@@ -7,6 +7,7 @@ session, allowing subsequent commands to run faster without Vivado startup overh
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -16,6 +17,97 @@ from typing import TYPE_CHECKING
 
 from vivado_mcp.vivado.build import BuildMessage, parse_vivado_output
 from vivado_mcp.vivado.detection import VivadoInstallation, get_default_vivado
+
+# Maximum output size in characters to prevent overwhelming MCP clients
+# This limit prevents token limit errors when large outputs are returned
+MAX_OUTPUT_SIZE = 50000  # ~50KB of text, roughly ~12,500 tokens
+
+# Directory for storing large output files
+_OUTPUT_DIR: Path | None = None
+
+
+def get_output_dir() -> Path:
+    """Get or create the directory for storing large output files.
+
+    Returns:
+        Path to the output directory
+    """
+    global _OUTPUT_DIR
+    if _OUTPUT_DIR is None:
+        # Create a persistent temp directory for this session
+        _OUTPUT_DIR = Path(tempfile.mkdtemp(prefix="vivado_mcp_output_"))
+    return _OUTPUT_DIR
+
+
+@dataclass
+class TruncationResult:
+    """Result of truncating output."""
+
+    truncated_output: str
+    was_truncated: bool
+    full_output_file: str | None = None
+
+
+def truncate_output(
+    output: str, max_size: int = MAX_OUTPUT_SIZE, save_full: bool = True
+) -> TruncationResult:
+    """Truncate output if it exceeds the maximum size.
+
+    When truncation occurs and save_full is True, the full output is written
+    to a temporary file that can be read later if needed.
+
+    Args:
+        output: The output string to potentially truncate
+        max_size: Maximum allowed size in characters
+        save_full: If True, save full output to a file when truncating
+
+    Returns:
+        TruncationResult with truncated output, flag, and optional file path
+    """
+    if len(output) <= max_size:
+        return TruncationResult(
+            truncated_output=output,
+            was_truncated=False,
+            full_output_file=None,
+        )
+
+    # Save full output to file if requested
+    full_output_file: str | None = None
+    if save_full:
+        try:
+            output_dir = get_output_dir()
+            output_file = output_dir / f"output_{uuid.uuid4().hex[:8]}.log"
+            output_file.write_text(output, encoding="utf-8")
+            full_output_file = str(output_file)
+        except OSError:
+            # If we can't write the file, continue without it
+            pass
+
+    # Calculate how much to show from start and end
+    # Show more from the end since recent output is often more relevant
+    start_size = max_size // 3
+    end_size = max_size - start_size - 300  # Reserve space for truncation message
+
+    if full_output_file:
+        truncation_msg = (
+            f"\n\n... OUTPUT TRUNCATED ({len(output):,} characters total, "
+            f"showing first {start_size:,} and last {end_size:,}) ...\n"
+            f"Full output saved to: {full_output_file}\n\n"
+        )
+    else:
+        truncation_msg = (
+            f"\n\n... OUTPUT TRUNCATED ({len(output):,} characters total, "
+            f"showing first {start_size:,} and last {end_size:,}) ...\n\n"
+        )
+
+    truncated = output[:start_size] + truncation_msg + output[-end_size:]
+
+    return TruncationResult(
+        truncated_output=truncated,
+        was_truncated=True,
+        full_output_file=full_output_file,
+    )
+
 
 if TYPE_CHECKING:
     pass
@@ -43,17 +135,28 @@ class TclCommandResult:
     execution_time_ms: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
-        """Convert to dictionary for JSON serialization."""
-        return {
+        """Convert to dictionary for JSON serialization.
+
+        Note: Output is automatically truncated if it exceeds MAX_OUTPUT_SIZE
+        to prevent overwhelming MCP clients with token limit errors. When
+        truncation occurs, the full output is saved to a file and the path
+        is included in the response.
+        """
+        result = truncate_output(self.output)
+        response: dict[str, object] = {
             "success": self.success,
             "command": self.command,
-            "output": self.output,
+            "output": result.truncated_output,
+            "output_truncated": result.was_truncated,
             "errors": [e.to_dict() for e in self.errors],
             "critical_warnings": [w.to_dict() for w in self.critical_warnings],
             "error_count": len(self.errors),
             "critical_warning_count": len(self.critical_warnings),
             "execution_time_ms": self.execution_time_ms,
         }
+        if result.full_output_file:
+            response["full_output_file"] = result.full_output_file
+        return response
 
 
 @dataclass

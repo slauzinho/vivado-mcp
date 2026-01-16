@@ -321,7 +321,11 @@ async def list_tools() -> list[Tool]:
                 "Execute a TCL command in a Vivado session. "
                 "If a persistent session is available, uses it for faster execution. "
                 "Otherwise falls back to batch mode. Supports any valid Vivado TCL command. "
-                "Returns command output, any errors, and execution time."
+                "Returns command output, any errors, and execution time. "
+                "Note: Output is automatically truncated to ~50KB if it exceeds the limit "
+                "to prevent token overflow errors. The 'output_truncated' field indicates "
+                "if truncation occurred, and 'full_output_file' provides the path to a "
+                "temporary file containing the complete output that can be read if needed."
             ),
             inputSchema={
                 "type": "object",
