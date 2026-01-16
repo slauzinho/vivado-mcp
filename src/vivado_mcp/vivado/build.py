@@ -120,6 +120,35 @@ class BuildResult:
         }
 
 
+@dataclass
+class BitstreamResult:
+    """Represents the result of a Vivado bitstream generation."""
+
+    success: bool
+    project_path: str
+    vivado_version: str
+    bitstream_path: str | None = None
+    errors: list[BuildMessage] = field(default_factory=list)
+    critical_warnings: list[BuildMessage] = field(default_factory=list)
+    exit_code: int = 0
+    stdout: str = ""
+    stderr: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "success": self.success,
+            "project_path": self.project_path,
+            "vivado_version": self.vivado_version,
+            "bitstream_path": self.bitstream_path,
+            "errors": [e.to_dict() for e in self.errors],
+            "critical_warnings": [w.to_dict() for w in self.critical_warnings],
+            "error_count": len(self.errors),
+            "critical_warning_count": len(self.critical_warnings),
+            "exit_code": self.exit_code,
+        }
+
+
 # Regex patterns for parsing Vivado output
 # Vivado messages follow format: SEVERITY: [ID] message
 _MESSAGE_PATTERN = re.compile(
@@ -304,6 +333,81 @@ def _generate_implementation_tcl(project_path: Path, stop_on_error: bool = True)
             "write_bitstream -force [get_property DIRECTORY [current_project]]/output.bit",
             "",
             'puts "Implementation completed successfully"',
+            "exit 0",
+        ])
+
+    return "\n".join(tcl_lines)
+
+
+def _generate_bitstream_tcl(project_path: Path, stop_on_error: bool = True) -> str:
+    """Generate TCL script for generating bitstream only (after implementation).
+
+    Args:
+        project_path: Path to the project (.xpr or .tcl)
+        stop_on_error: If True, stop the build on first error
+
+    Returns:
+        TCL script content as a string
+    """
+    project_path_tcl = str(project_path).replace("\\", "/")
+    is_xpr = project_path.suffix.lower() == ".xpr"
+
+    tcl_lines = [
+        "# Auto-generated bitstream script for vivado-mcp",
+        "# Stop on first error if requested",
+    ]
+
+    if stop_on_error:
+        tcl_lines.append("set_msg_config -severity ERROR -stop true")
+
+    if is_xpr:
+        # For .xpr files, open the project and generate bitstream only
+        tcl_lines.extend([
+            f'open_project "{project_path_tcl}"',
+            "",
+            "# Verify synthesis is complete",
+            'if {[get_property PROGRESS [get_runs synth_1]] != "100%"} {',
+            '    puts "ERROR: Synthesis not complete. Run synthesis first."',
+            "    exit 1",
+            "}",
+            "",
+            "# Verify implementation is complete",
+            'if {[get_property PROGRESS [get_runs impl_1]] != "100%"} {',
+            '    puts "ERROR: Implementation not complete. Run implementation first."',
+            "    exit 1",
+            "}",
+            "",
+            "# Generate bitstream only",
+            "launch_runs impl_1 -to_step write_bitstream -jobs 4",
+            "wait_on_run impl_1",
+            "",
+            "# Find and report bitstream file path",
+            "set impl_dir [get_property DIRECTORY [get_runs impl_1]]",
+            'set bit_files [glob -nocomplain -directory $impl_dir "*.bit"]',
+            'if {[llength $bit_files] > 0} {',
+            '    puts "BITSTREAM_FILE: [lindex $bit_files 0]"',
+            '} else {',
+            '    puts "ERROR: Bitstream file not found after generation"',
+            "    exit 1",
+            "}",
+            "",
+            'puts "Bitstream generation completed successfully"',
+            "close_project",
+            "exit 0",
+        ])
+    else:
+        # For .tcl files, source them and generate bitstream only
+        # Assumes implementation has already been run
+        tcl_lines.extend([
+            f'source "{project_path_tcl}"',
+            "",
+            "# Generate bitstream (assumes design is routed)",
+            "set output_dir [get_property DIRECTORY [current_project]]",
+            "set bitstream_path ${output_dir}/output.bit",
+            "write_bitstream -force $bitstream_path",
+            "",
+            'puts "BITSTREAM_FILE: $bitstream_path"',
+            'puts "Bitstream generation completed successfully"',
             "exit 0",
         ])
 
@@ -1094,6 +1198,217 @@ async def run_implementation(
             success=success,
             project_path=str(validated_path),
             vivado_version=vivado_install.version,
+            errors=errors,
+            critical_warnings=critical_warnings,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    finally:
+        # Clean up temporary TCL file
+        try:
+            os.unlink(tcl_path)
+        except OSError:
+            pass
+
+
+# Pattern to parse bitstream file path from Vivado output
+_BITSTREAM_PATH_PATTERN = re.compile(r"^BITSTREAM_FILE:\s*(.+)$", re.MULTILINE)
+
+
+def _parse_bitstream_path(output: str) -> str | None:
+    """Parse the bitstream file path from Vivado output.
+
+    The TCL script outputs a line "BITSTREAM_FILE: /path/to/file.bit"
+    which we parse to extract the path.
+
+    Args:
+        output: The stdout/stderr output from Vivado
+
+    Returns:
+        The bitstream file path if found, None otherwise
+    """
+    match = _BITSTREAM_PATH_PATTERN.search(output)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _find_bitstream_file(project_path: Path) -> str | None:
+    """Find the bitstream file in the implementation run directory.
+
+    Args:
+        project_path: Path to the project file (.xpr)
+
+    Returns:
+        Path to the bitstream file if found, None otherwise
+    """
+    project_dir = project_path.parent
+    project_name = project_path.stem
+
+    # Look in the standard impl_1 directory
+    impl_dir = project_dir / f"{project_name}.runs" / "impl_1"
+    if impl_dir.exists():
+        bit_files = list(impl_dir.glob("*.bit"))
+        if bit_files:
+            return str(bit_files[0])
+
+    return None
+
+
+async def run_bitstream_generation(
+    project_path: str | Path,
+    vivado_install: VivadoInstallation | None = None,
+    timeout: int | None = None,
+) -> BitstreamResult:
+    """Generate bitstream only (after implementation is complete).
+
+    This runs only the bitstream generation step in batch mode, allowing
+    regeneration of the bitstream without re-running implementation.
+
+    Requires that implementation has already been completed successfully.
+
+    Args:
+        project_path: Path to the Vivado project (.xpr) or TCL script (.tcl)
+        vivado_install: Optional specific Vivado installation to use.
+                       If None, auto-detects the installation.
+        timeout: Optional timeout in seconds for the bitstream generation process.
+
+    Returns:
+        BitstreamResult containing success status, bitstream path, errors, and warnings
+    """
+    # Validate project path
+    validated_path, error = _validate_project_path(project_path)
+    if error:
+        return BitstreamResult(
+            success=False,
+            project_path=str(project_path),
+            vivado_version="unknown",
+            errors=[BuildMessage(
+                severity="ERROR",
+                id="vivado-mcp",
+                message=error,
+            )],
+            exit_code=-1,
+        )
+
+    # For .xpr projects, verify implementation is complete before generating bitstream
+    if validated_path.suffix.lower() == ".xpr":
+        build_status = get_build_status(validated_path)
+        impl_state = build_status.implementation
+        if impl_state is None or impl_state.state != BuildState.COMPLETED:
+            return BitstreamResult(
+                success=False,
+                project_path=str(validated_path),
+                vivado_version="unknown",
+                errors=[BuildMessage(
+                    severity="ERROR",
+                    id="vivado-mcp",
+                    message=(
+                        "Implementation not complete. "
+                        "Run implementation before generating bitstream."
+                    ),
+                )],
+                exit_code=-1,
+            )
+
+    # Get Vivado installation
+    if vivado_install is None:
+        vivado_install = get_default_vivado()
+
+    if vivado_install is None:
+        return BitstreamResult(
+            success=False,
+            project_path=str(validated_path),
+            vivado_version="unknown",
+            errors=[BuildMessage(
+                severity="ERROR",
+                id="vivado-mcp",
+                message="No Vivado installation found. Install Vivado or set VIVADO_PATH.",
+            )],
+            exit_code=-1,
+        )
+
+    # Generate the bitstream TCL script
+    bitstream_tcl = _generate_bitstream_tcl(validated_path)
+
+    # Write TCL script to a temporary file
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".tcl",
+        delete=False,
+        prefix="vivado_bitstream_",
+    ) as tcl_file:
+        tcl_file.write(bitstream_tcl)
+        tcl_path = tcl_file.name
+
+    try:
+        # Build command for batch mode execution
+        vivado_exe = str(vivado_install.executable)
+        cmd = [
+            vivado_exe,
+            "-mode", "batch",
+            "-source", tcl_path,
+            "-nojournal",
+            "-nolog",
+        ]
+
+        # Set working directory to project directory
+        cwd = validated_path.parent
+
+        # Create subprocess
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+        )
+
+        try:
+            # Wait for completion with optional timeout
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return BitstreamResult(
+                success=False,
+                project_path=str(validated_path),
+                vivado_version=vivado_install.version,
+                errors=[BuildMessage(
+                    severity="ERROR",
+                    id="vivado-mcp",
+                    message=f"Bitstream generation timed out after {timeout} seconds",
+                )],
+                exit_code=-1,
+            )
+
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+        # Parse output for errors and warnings
+        combined_output = stdout + "\n" + stderr
+        errors, critical_warnings = parse_vivado_output(combined_output)
+
+        # Parse bitstream file path from output
+        bitstream_path = _parse_bitstream_path(combined_output)
+
+        # If not found in output, try to find it in the impl directory
+        if bitstream_path is None and validated_path.suffix.lower() == ".xpr":
+            bitstream_path = _find_bitstream_file(validated_path)
+
+        # Determine success
+        exit_code = process.returncode or 0
+        success = exit_code == 0 and len(errors) == 0
+
+        return BitstreamResult(
+            success=success,
+            project_path=str(validated_path),
+            vivado_version=vivado_install.version,
+            bitstream_path=bitstream_path,
             errors=errors,
             critical_warnings=critical_warnings,
             exit_code=exit_code,

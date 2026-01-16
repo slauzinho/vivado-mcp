@@ -9,19 +9,24 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from vivado_mcp.vivado.build import (
+    BitstreamResult,
     BuildMessage,
     BuildResult,
     BuildState,
     BuildStatus,
     RunStatus,
+    _find_bitstream_file,
+    _generate_bitstream_tcl,
     _generate_build_tcl,
     _generate_implementation_tcl,
     _generate_synthesis_tcl,
     _get_run_directory_timestamp,
+    _parse_bitstream_path,
     _parse_run_status,
     _validate_project_path,
     get_build_status,
     parse_vivado_output,
+    run_bitstream_generation,
     run_implementation,
     run_synthesis,
     run_vivado_build,
@@ -1447,3 +1452,507 @@ class TestRunImplementation:
             result = await run_implementation(project)
             # TCL projects don't require synthesis check
             assert result.success is True
+
+
+class TestBitstreamResult:
+    """Tests for BitstreamResult dataclass."""
+
+    def test_to_dict_success(self) -> None:
+        result = BitstreamResult(
+            success=True,
+            project_path="/path/to/project.xpr",
+            vivado_version="2023.2",
+            bitstream_path="/path/to/output.bit",
+        )
+        d = result.to_dict()
+        assert d["success"] is True
+        assert d["project_path"] == "/path/to/project.xpr"
+        assert d["vivado_version"] == "2023.2"
+        assert d["bitstream_path"] == "/path/to/output.bit"
+        assert d["errors"] == []
+        assert d["critical_warnings"] == []
+        assert d["error_count"] == 0
+        assert d["critical_warning_count"] == 0
+        assert d["exit_code"] == 0
+
+    def test_to_dict_with_errors(self) -> None:
+        error = BuildMessage(
+            severity="ERROR",
+            id="Bitstream 12-34",
+            message="Bitstream generation failed",
+        )
+        result = BitstreamResult(
+            success=False,
+            project_path="/path/to/project.xpr",
+            vivado_version="2023.2",
+            bitstream_path=None,
+            errors=[error],
+            exit_code=1,
+        )
+        d = result.to_dict()
+        assert d["success"] is False
+        assert d["bitstream_path"] is None
+        assert d["error_count"] == 1
+        assert len(d["errors"]) == 1  # type: ignore[arg-type]
+
+
+class TestParseBitstreamPath:
+    """Tests for _parse_bitstream_path function."""
+
+    def test_parse_bitstream_path_found(self) -> None:
+        output = "Some output\nBITSTREAM_FILE: /path/to/design.bit\nMore output"
+        result = _parse_bitstream_path(output)
+        assert result == "/path/to/design.bit"
+
+    def test_parse_bitstream_path_not_found(self) -> None:
+        output = "Some output without bitstream file path"
+        result = _parse_bitstream_path(output)
+        assert result is None
+
+    def test_parse_bitstream_path_with_spaces(self) -> None:
+        output = "BITSTREAM_FILE:   /path/with spaces/design.bit  \n"
+        result = _parse_bitstream_path(output)
+        assert result == "/path/with spaces/design.bit"
+
+
+class TestFindBitstreamFile:
+    """Tests for _find_bitstream_file function."""
+
+    def test_find_bitstream_file_found(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+        bitstream = impl_dir / "design.bit"
+        bitstream.touch()
+
+        result = _find_bitstream_file(project)
+        assert result == str(bitstream)
+
+    def test_find_bitstream_file_not_found(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        result = _find_bitstream_file(project)
+        assert result is None
+
+    def test_find_bitstream_file_impl_dir_exists_no_bit(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        project.touch()
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+
+        result = _find_bitstream_file(project)
+        assert result is None
+
+
+class TestGenerateBitstreamTcl:
+    """Tests for TCL script generation for bitstream-only."""
+
+    def test_xpr_project(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        tcl = _generate_bitstream_tcl(project)
+
+        # Verify bitstream-only commands are present
+        assert "open_project" in tcl
+        assert "impl_1" in tcl
+        assert "write_bitstream" in tcl
+        assert "Bitstream generation completed successfully" in tcl
+        assert "set_msg_config -severity ERROR -stop true" in tcl
+        assert "BITSTREAM_FILE:" in tcl
+
+        # Verify implementation check is present (to require completed implementation)
+        assert "Implementation not complete" in tcl
+
+        # Verify synthesis check is present
+        assert "Synthesis not complete" in tcl
+
+        # Verify implementation execution commands are NOT present
+        assert "reset_run impl_1" not in tcl
+        assert "opt_design" not in tcl
+        assert "place_design" not in tcl
+        assert "route_design" not in tcl
+
+    def test_tcl_project(self, tmp_path: Path) -> None:
+        project = tmp_path / "build.tcl"
+        tcl = _generate_bitstream_tcl(project)
+
+        # For TCL projects, should source the file
+        assert "source" in tcl
+        assert "write_bitstream" in tcl
+        assert "Bitstream generation completed successfully" in tcl
+        assert "BITSTREAM_FILE:" in tcl
+
+        # Verify implementation commands are NOT present
+        assert "opt_design" not in tcl
+        assert "place_design" not in tcl
+        assert "route_design" not in tcl
+
+    def test_stop_on_error_disabled(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        tcl = _generate_bitstream_tcl(project, stop_on_error=False)
+        assert "set_msg_config -severity ERROR -stop true" not in tcl
+
+
+class TestRunBitstreamGeneration:
+    """Tests for the bitstream generation function."""
+
+    @pytest.mark.asyncio
+    async def test_project_not_found(self, tmp_path: Path) -> None:
+        """Test handling of non-existent project file."""
+        result = await run_bitstream_generation(tmp_path / "nonexistent.xpr")
+        assert result.success is False
+        assert len(result.errors) == 1
+        assert "not found" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_invalid_project_type(self, tmp_path: Path) -> None:
+        """Test handling of invalid file type."""
+        invalid_file = tmp_path / "design.v"
+        invalid_file.touch()
+        result = await run_bitstream_generation(invalid_file)
+        assert result.success is False
+        assert len(result.errors) == 1
+        assert "Invalid project file type" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_implementation_not_complete(self, tmp_path: Path) -> None:
+        """Test handling when implementation is not complete."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        # Create synthesis complete but implementation not complete
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+        (synth_dir / "runme.log").write_text("synth_design Complete!")
+
+        # impl_1 not complete
+        result = await run_bitstream_generation(project)
+        assert result.success is False
+        assert len(result.errors) == 1
+        assert "Implementation not complete" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_no_vivado_installation(self, tmp_path: Path) -> None:
+        """Test handling when no Vivado is found."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        # Create completed implementation run
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+        (synth_dir / "runme.log").write_text("synth_design Complete!")
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+        (impl_dir / ".vivado.begin.rst").touch()
+        (impl_dir / ".vivado.end.rst").touch()
+        (impl_dir / "design.bit").touch()
+
+        with patch(
+            "vivado_mcp.vivado.build.get_default_vivado",
+            return_value=None,
+        ):
+            result = await run_bitstream_generation(project)
+            assert result.success is False
+            assert len(result.errors) == 1
+            assert "No Vivado installation found" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_successful_bitstream_generation(self, tmp_path: Path) -> None:
+        """Test successful bitstream generation."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        # Create completed implementation run
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+        (synth_dir / "runme.log").write_text("synth_design Complete!")
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+        (impl_dir / ".vivado.begin.rst").touch()
+        (impl_dir / ".vivado.end.rst").touch()
+        (impl_dir / "design.bit").touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        bitstream_path = str(impl_dir / "design.bit")
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        output = (
+            f"BITSTREAM_FILE: {bitstream_path}\n"
+            f"Bitstream generation completed successfully\n"
+        ).encode()
+        mock_process.communicate = AsyncMock(return_value=(output, b""))
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_bitstream_generation(project)
+            assert result.success is True
+            assert result.vivado_version == "2023.2"
+            assert result.bitstream_path == bitstream_path
+            assert len(result.errors) == 0
+
+    @pytest.mark.asyncio
+    async def test_bitstream_generation_with_errors(self, tmp_path: Path) -> None:
+        """Test bitstream generation that produces errors."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        # Create completed implementation run
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+        (synth_dir / "runme.log").write_text("synth_design Complete!")
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+        (impl_dir / ".vivado.begin.rst").touch()
+        (impl_dir / ".vivado.end.rst").touch()
+        (impl_dir / "design.bit").touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        error_output = b"ERROR: [Bitstream 12-34] DRC violation\n"
+        mock_process = MagicMock()
+        mock_process.returncode = 1
+        mock_process.communicate = AsyncMock(return_value=(error_output, b""))
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_bitstream_generation(project)
+            assert result.success is False
+            assert result.exit_code == 1
+            assert len(result.errors) == 1
+            assert result.errors[0].id == "Bitstream 12-34"
+
+    @pytest.mark.asyncio
+    async def test_bitstream_generation_timeout(self, tmp_path: Path) -> None:
+        """Test bitstream generation timeout handling."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        # Create completed implementation run
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+        (synth_dir / "runme.log").write_text("synth_design Complete!")
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+        (impl_dir / ".vivado.begin.rst").touch()
+        (impl_dir / ".vivado.end.rst").touch()
+        (impl_dir / "design.bit").touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        mock_process = MagicMock()
+        mock_process.kill = MagicMock()
+        mock_process.wait = AsyncMock()
+
+        async def slow_communicate() -> tuple[bytes, bytes]:
+            await asyncio.sleep(10)
+            return (b"", b"")
+
+        mock_process.communicate = slow_communicate
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_bitstream_generation(project, timeout=1)
+            assert result.success is False
+            assert len(result.errors) == 1
+            assert "timed out" in result.errors[0].message
+            mock_process.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_bitstream_generation_with_critical_warnings(self, tmp_path: Path) -> None:
+        """Test bitstream generation that produces critical warnings."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        # Create completed implementation run
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+        (synth_dir / "runme.log").write_text("synth_design Complete!")
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+        (impl_dir / ".vivado.begin.rst").touch()
+        (impl_dir / ".vivado.end.rst").touch()
+        (impl_dir / "design.bit").touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        bitstream_path = str(impl_dir / "design.bit")
+        warning_output = (
+            f"CRITICAL WARNING: [DRC RPBF-3] Some DRC warning\n"
+            f"BITSTREAM_FILE: {bitstream_path}\n"
+            f"Bitstream generation completed successfully\n"
+        ).encode()
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(warning_output, b""))
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_bitstream_generation(project)
+            assert result.success is True
+            assert result.bitstream_path == bitstream_path
+            assert len(result.errors) == 0
+            assert len(result.critical_warnings) == 1
+            assert result.critical_warnings[0].id == "DRC RPBF-3"
+
+    @pytest.mark.asyncio
+    async def test_tcl_project_skips_implementation_check(self, tmp_path: Path) -> None:
+        """Test that TCL projects skip the implementation completion check."""
+        project = tmp_path / "build.tcl"
+        project.touch()
+
+        # No runs directory - for TCL projects, this is OK
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        output = (
+            b"BITSTREAM_FILE: /path/to/output.bit\n"
+            b"Bitstream generation completed successfully\n"
+        )
+        mock_process.communicate = AsyncMock(return_value=(output, b""))
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_bitstream_generation(project)
+            # TCL projects don't require implementation check
+            assert result.success is True
+            assert result.bitstream_path == "/path/to/output.bit"
+
+    @pytest.mark.asyncio
+    async def test_bitstream_path_fallback_to_file_search(self, tmp_path: Path) -> None:
+        """Test that bitstream path falls back to file search if not in output."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        # Create completed implementation run with bitstream file
+        runs_dir = tmp_path / "test.runs"
+        runs_dir.mkdir()
+        synth_dir = runs_dir / "synth_1"
+        synth_dir.mkdir()
+        (synth_dir / ".vivado.begin.rst").touch()
+        (synth_dir / ".vivado.end.rst").touch()
+        (synth_dir / "runme.log").write_text("synth_design Complete!")
+        impl_dir = runs_dir / "impl_1"
+        impl_dir.mkdir()
+        (impl_dir / ".vivado.begin.rst").touch()
+        (impl_dir / ".vivado.end.rst").touch()
+        bitstream_file = impl_dir / "design.bit"
+        bitstream_file.touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        # Output without BITSTREAM_FILE marker
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(
+            return_value=(b"Bitstream generation completed successfully\n", b"")
+        )
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_bitstream_generation(project)
+            assert result.success is True
+            # Should find the bitstream file through fallback search
+            assert result.bitstream_path == str(bitstream_file)
