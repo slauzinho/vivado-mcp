@@ -109,9 +109,12 @@ class TestVivadoConfigLoad:
             assert config.vivado_path == Path("/env/path")
             assert config.vivado_version == "2023.2"
 
-    def test_load_defaults_only(self) -> None:
+    def test_load_defaults_only(self, tmp_path: Path) -> None:
         """Test loading with no config file and no env vars."""
-        with patch.dict(os.environ, {}, clear=True):
+        # Change to tmp_path to avoid picking up any real config files in cwd
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "vivado_mcp.config.Path.cwd", return_value=tmp_path
+        ), patch("vivado_mcp.config.Path.home", return_value=tmp_path):
             # Use a non-existent path to avoid picking up any real config
             config = VivadoConfig.load(config_path=Path("/nonexistent/config.json"))
             assert config.vivado_path is None
@@ -129,9 +132,10 @@ class TestVivadoConfigToDict:
             additional_search_paths=[Path("/path1"), Path("/path2")],
         )
         result = config.to_dict()
-        assert result["vivado_path"] == "/opt/vivado"
+        # Use Path to normalize expected values for cross-platform compatibility
+        assert result["vivado_path"] == str(Path("/opt/vivado"))
         assert result["vivado_version"] == "2023.2"
-        assert result["additional_search_paths"] == ["/path1", "/path2"]
+        assert result["additional_search_paths"] == [str(Path("/path1")), str(Path("/path2"))]
 
     def test_to_dict_with_none(self) -> None:
         """Test converting config with None values."""

@@ -17,6 +17,23 @@ from vivado_mcp.vivado.detection import (
 )
 
 
+def create_mock_vivado_executable(bin_dir: Path) -> Path:
+    """Create a mock Vivado executable appropriate for the current platform.
+
+    Args:
+        bin_dir: The bin directory where the executable should be created
+
+    Returns:
+        Path to the created executable
+    """
+    if os.name == "nt":
+        executable = bin_dir / "vivado.bat"
+    else:
+        executable = bin_dir / "vivado"
+    executable.touch()
+    return executable
+
+
 class TestParseVersion:
     """Tests for version parsing."""
 
@@ -60,8 +77,9 @@ class TestVivadoInstallation:
         )
         result = install.to_dict()
         assert result["version"] == "2023.2"
-        assert result["path"] == "/opt/Xilinx/Vivado/2023.2"
-        assert result["executable"] == "/opt/Xilinx/Vivado/2023.2/bin/vivado"
+        # Use Path to normalize expected values for cross-platform compatibility
+        assert result["path"] == str(Path("/opt/Xilinx/Vivado/2023.2"))
+        assert result["executable"] == str(Path("/opt/Xilinx/Vivado/2023.2/bin/vivado"))
 
 
 class TestDetectVivadoInstallations:
@@ -73,17 +91,16 @@ class TestDetectVivadoInstallations:
         result = detect_vivado_installations(search_paths=[tmp_path])
         assert result == []
 
-    def test_detect_single_installation_linux(self, tmp_path: Path) -> None:
-        """Test detecting a single Vivado installation (Linux-style)."""
+    def test_detect_single_installation(self, tmp_path: Path) -> None:
+        """Test detecting a single Vivado installation."""
         # Create mock Vivado installation
         vivado_base = tmp_path / "Xilinx" / "Vivado"
         vivado_2023 = vivado_base / "2023.2"
         vivado_bin = vivado_2023 / "bin"
         vivado_bin.mkdir(parents=True)
 
-        # Create mock executable (Linux style)
-        vivado_exec = vivado_bin / "vivado"
-        vivado_exec.touch()
+        # Create mock executable for current platform
+        vivado_exec = create_mock_vivado_executable(vivado_bin)
 
         result = detect_vivado_installations(search_paths=[vivado_base])
         assert len(result) == 1
@@ -99,7 +116,7 @@ class TestDetectVivadoInstallations:
         for version in ["2021.2", "2023.2", "2022.1"]:
             version_dir = vivado_base / version / "bin"
             version_dir.mkdir(parents=True)
-            (version_dir / "vivado").touch()
+            create_mock_vivado_executable(version_dir)
 
         result = detect_vivado_installations(search_paths=[vivado_base])
         assert len(result) == 3
@@ -144,7 +161,7 @@ class TestGetDefaultVivado:
         for version in ["2021.2", "2023.2"]:
             version_dir = vivado_base / version / "bin"
             version_dir.mkdir(parents=True)
-            (version_dir / "vivado").touch()
+            create_mock_vivado_executable(version_dir)
 
         with patch(
             "vivado_mcp.vivado.detection._get_search_paths",
@@ -161,7 +178,7 @@ class TestGetDefaultVivado:
         for version in ["2021.2", "2023.2"]:
             version_dir = vivado_base / version / "bin"
             version_dir.mkdir(parents=True)
-            (version_dir / "vivado").touch()
+            create_mock_vivado_executable(version_dir)
 
         with patch(
             "vivado_mcp.vivado.detection._get_search_paths",
@@ -176,7 +193,7 @@ class TestGetDefaultVivado:
         vivado_path = tmp_path / "custom" / "vivado" / "2023.2"
         vivado_bin = vivado_path / "bin"
         vivado_bin.mkdir(parents=True)
-        (vivado_bin / "vivado").touch()
+        create_mock_vivado_executable(vivado_bin)
 
         result = get_default_vivado(override_path=vivado_path)
         assert result is not None
@@ -193,7 +210,7 @@ class TestGetDefaultVivado:
         vivado_base = tmp_path / "Xilinx" / "Vivado"
         version_dir = vivado_base / "2023.2" / "bin"
         version_dir.mkdir(parents=True)
-        (version_dir / "vivado").touch()
+        create_mock_vivado_executable(version_dir)
 
         with patch(
             "vivado_mcp.vivado.detection._get_search_paths",
