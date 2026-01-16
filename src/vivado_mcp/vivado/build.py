@@ -174,6 +174,66 @@ def parse_vivado_output(output: str) -> tuple[list[BuildMessage], list[BuildMess
     return errors, critical_warnings
 
 
+def _generate_synthesis_tcl(project_path: Path, stop_on_error: bool = True) -> str:
+    """Generate TCL script for running synthesis only.
+
+    Args:
+        project_path: Path to the project (.xpr or .tcl)
+        stop_on_error: If True, stop the build on first error
+
+    Returns:
+        TCL script content as a string
+    """
+    project_path_tcl = str(project_path).replace("\\", "/")
+    is_xpr = project_path.suffix.lower() == ".xpr"
+
+    tcl_lines = [
+        "# Auto-generated synthesis script for vivado-mcp",
+        "# Stop on first error if requested",
+    ]
+
+    if stop_on_error:
+        tcl_lines.append("set_msg_config -severity ERROR -stop true")
+
+    if is_xpr:
+        # For .xpr files, open the project and run synthesis only
+        tcl_lines.extend([
+            f'open_project "{project_path_tcl}"',
+            "",
+            "# Run synthesis",
+            "reset_run synth_1",
+            "launch_runs synth_1 -jobs 4",
+            "wait_on_run synth_1",
+            "",
+            "# Check synthesis result",
+            'if {[get_property PROGRESS [get_runs synth_1]] != "100%"} {',
+            '    puts "ERROR: Synthesis failed"',
+            "    exit 1",
+            "}",
+            'if {[get_property STATUS [get_runs synth_1]] != "synth_design Complete!"} {',
+            '    puts "ERROR: Synthesis did not complete successfully"',
+            "    exit 1",
+            "}",
+            "",
+            'puts "Synthesis completed successfully"',
+            "close_project",
+            "exit 0",
+        ])
+    else:
+        # For .tcl files, source them and run synthesis only
+        tcl_lines.extend([
+            f'source "{project_path_tcl}"',
+            "",
+            "# Run synthesis only",
+            "synth_design",
+            "",
+            'puts "Synthesis completed successfully"',
+            "exit 0",
+        ])
+
+    return "\n".join(tcl_lines)
+
+
 def _generate_build_tcl(project_path: Path, stop_on_error: bool = True) -> str:
     """Generate TCL script for running a full build.
 
@@ -678,3 +738,140 @@ def get_build_status(project_path: str | Path) -> BuildStatus:
         last_build_timestamp=last_timestamp,
         runs_directory_exists=True,
     )
+
+
+async def run_synthesis(
+    project_path: str | Path,
+    vivado_install: VivadoInstallation | None = None,
+    timeout: int | None = None,
+) -> BuildResult:
+    """Run Vivado synthesis only.
+
+    This runs only the synthesis step in batch mode, allowing quick checking
+    for synthesis errors without running the full build flow.
+
+    Args:
+        project_path: Path to the Vivado project (.xpr) or TCL script (.tcl)
+        vivado_install: Optional specific Vivado installation to use.
+                       If None, auto-detects the installation.
+        timeout: Optional timeout in seconds for the synthesis process.
+
+    Returns:
+        BuildResult containing success status, errors, and warnings
+    """
+    # Validate project path
+    validated_path, error = _validate_project_path(project_path)
+    if error:
+        return BuildResult(
+            success=False,
+            project_path=str(project_path),
+            vivado_version="unknown",
+            errors=[BuildMessage(
+                severity="ERROR",
+                id="vivado-mcp",
+                message=error,
+            )],
+            exit_code=-1,
+        )
+
+    # Get Vivado installation
+    if vivado_install is None:
+        vivado_install = get_default_vivado()
+
+    if vivado_install is None:
+        return BuildResult(
+            success=False,
+            project_path=str(validated_path),
+            vivado_version="unknown",
+            errors=[BuildMessage(
+                severity="ERROR",
+                id="vivado-mcp",
+                message="No Vivado installation found. Install Vivado or set VIVADO_PATH.",
+            )],
+            exit_code=-1,
+        )
+
+    # Generate the synthesis TCL script
+    synth_tcl = _generate_synthesis_tcl(validated_path)
+
+    # Write TCL script to a temporary file
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".tcl",
+        delete=False,
+        prefix="vivado_synth_",
+    ) as tcl_file:
+        tcl_file.write(synth_tcl)
+        tcl_path = tcl_file.name
+
+    try:
+        # Build command for batch mode execution
+        vivado_exe = str(vivado_install.executable)
+        cmd = [
+            vivado_exe,
+            "-mode", "batch",
+            "-source", tcl_path,
+            "-nojournal",
+            "-nolog",
+        ]
+
+        # Set working directory to project directory
+        cwd = validated_path.parent
+
+        # Create subprocess
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+        )
+
+        try:
+            # Wait for completion with optional timeout
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return BuildResult(
+                success=False,
+                project_path=str(validated_path),
+                vivado_version=vivado_install.version,
+                errors=[BuildMessage(
+                    severity="ERROR",
+                    id="vivado-mcp",
+                    message=f"Synthesis timed out after {timeout} seconds",
+                )],
+                exit_code=-1,
+            )
+
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+        # Parse output for errors and warnings
+        combined_output = stdout + "\n" + stderr
+        errors, critical_warnings = parse_vivado_output(combined_output)
+
+        # Determine success
+        exit_code = process.returncode or 0
+        success = exit_code == 0 and len(errors) == 0
+
+        return BuildResult(
+            success=success,
+            project_path=str(validated_path),
+            vivado_version=vivado_install.version,
+            errors=errors,
+            critical_warnings=critical_warnings,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    finally:
+        # Clean up temporary TCL file
+        try:
+            os.unlink(tcl_path)
+        except OSError:
+            pass

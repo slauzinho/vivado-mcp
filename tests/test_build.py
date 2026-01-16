@@ -15,11 +15,13 @@ from vivado_mcp.vivado.build import (
     BuildStatus,
     RunStatus,
     _generate_build_tcl,
+    _generate_synthesis_tcl,
     _get_run_directory_timestamp,
     _parse_run_status,
     _validate_project_path,
     get_build_status,
     parse_vivado_output,
+    run_synthesis,
     run_vivado_build,
 )
 from vivado_mcp.vivado.detection import VivadoInstallation
@@ -763,3 +765,288 @@ class TestGetBuildStatus:
 
         result = get_build_status(project)
         assert result.last_build_timestamp is not None
+
+
+class TestGenerateSynthesisTcl:
+    """Tests for TCL script generation for synthesis-only."""
+
+    def test_xpr_project(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        tcl = _generate_synthesis_tcl(project)
+
+        # Verify synthesis-only commands are present
+        assert "open_project" in tcl
+        assert "synth_1" in tcl
+        assert "Synthesis completed successfully" in tcl
+        assert "set_msg_config -severity ERROR -stop true" in tcl
+
+        # Verify implementation commands are NOT present
+        assert "impl_1" not in tcl
+        assert "write_bitstream" not in tcl
+        assert "opt_design" not in tcl
+        assert "place_design" not in tcl
+        assert "route_design" not in tcl
+
+    def test_tcl_project(self, tmp_path: Path) -> None:
+        project = tmp_path / "build.tcl"
+        tcl = _generate_synthesis_tcl(project)
+
+        # For TCL projects, should source the file
+        assert "source" in tcl
+        assert "synth_design" in tcl
+        assert "Synthesis completed successfully" in tcl
+
+        # Verify implementation commands are NOT present
+        assert "opt_design" not in tcl
+        assert "place_design" not in tcl
+        assert "route_design" not in tcl
+        assert "write_bitstream" not in tcl
+
+    def test_stop_on_error_disabled(self, tmp_path: Path) -> None:
+        project = tmp_path / "test.xpr"
+        tcl = _generate_synthesis_tcl(project, stop_on_error=False)
+        assert "set_msg_config -severity ERROR -stop true" not in tcl
+
+
+class TestRunSynthesis:
+    """Tests for the synthesis-only function."""
+
+    @pytest.mark.asyncio
+    async def test_project_not_found(self, tmp_path: Path) -> None:
+        """Test handling of non-existent project file."""
+        result = await run_synthesis(tmp_path / "nonexistent.xpr")
+        assert result.success is False
+        assert len(result.errors) == 1
+        assert "not found" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_invalid_project_type(self, tmp_path: Path) -> None:
+        """Test handling of invalid file type."""
+        invalid_file = tmp_path / "design.v"
+        invalid_file.touch()
+        result = await run_synthesis(invalid_file)
+        assert result.success is False
+        assert len(result.errors) == 1
+        assert "Invalid project file type" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_no_vivado_installation(self, tmp_path: Path) -> None:
+        """Test handling when no Vivado is found."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        with patch(
+            "vivado_mcp.vivado.build.get_default_vivado",
+            return_value=None,
+        ):
+            result = await run_synthesis(project)
+            assert result.success is False
+            assert len(result.errors) == 1
+            assert "No Vivado installation found" in result.errors[0].message
+
+    @pytest.mark.asyncio
+    async def test_successful_synthesis(self, tmp_path: Path) -> None:
+        """Test successful synthesis execution."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        # Mock the subprocess
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(
+            return_value=(b"Synthesis completed successfully\n", b"")
+        )
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_synthesis(project)
+            assert result.success is True
+            assert result.vivado_version == "2023.2"
+            assert len(result.errors) == 0
+
+    @pytest.mark.asyncio
+    async def test_synthesis_with_errors(self, tmp_path: Path) -> None:
+        """Test synthesis that produces errors."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        error_output = b"ERROR: [Synth 8-87] Signal 'clk' not found\n"
+        mock_process = MagicMock()
+        mock_process.returncode = 1
+        mock_process.communicate = AsyncMock(return_value=(error_output, b""))
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_synthesis(project)
+            assert result.success is False
+            assert result.exit_code == 1
+            assert len(result.errors) == 1
+            assert result.errors[0].id == "Synth 8-87"
+
+    @pytest.mark.asyncio
+    async def test_synthesis_timeout(self, tmp_path: Path) -> None:
+        """Test synthesis timeout handling."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        mock_process = MagicMock()
+        mock_process.kill = MagicMock()
+        mock_process.wait = AsyncMock()
+
+        async def slow_communicate() -> tuple[bytes, bytes]:
+            await asyncio.sleep(10)
+            return (b"", b"")
+
+        mock_process.communicate = slow_communicate
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_synthesis(project, timeout=1)
+            assert result.success is False
+            assert len(result.errors) == 1
+            assert "timed out" in result.errors[0].message
+            mock_process.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_custom_vivado_installation(self, tmp_path: Path) -> None:
+        """Test using a custom Vivado installation."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        custom_install = VivadoInstallation(
+            version="2024.1",
+            path=tmp_path / "Custom" / "Vivado" / "2024.1",
+            executable=tmp_path / "Custom" / "Vivado" / "2024.1" / "bin" / "vivado",
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b"Success\n", b""))
+
+        with patch(
+            "asyncio.create_subprocess_exec",
+            return_value=mock_process,
+        ) as mock_exec:
+            result = await run_synthesis(project, vivado_install=custom_install)
+            assert result.success is True
+            assert result.vivado_version == "2024.1"
+
+            # Verify the custom executable was used
+            call_args = mock_exec.call_args[0]
+            assert "2024.1" in str(call_args[0])
+
+    @pytest.mark.asyncio
+    async def test_batch_mode_flags(self, tmp_path: Path) -> None:
+        """Test that Vivado is called with correct batch mode flags."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(b"Success\n", b""))
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ) as mock_exec,
+        ):
+            await run_synthesis(project)
+
+            # Check batch mode flags
+            call_args = mock_exec.call_args[0]
+            assert "-mode" in call_args
+            mode_idx = call_args.index("-mode")
+            assert call_args[mode_idx + 1] == "batch"
+
+            # Check no GUI flags
+            assert "-nojournal" in call_args
+            assert "-nolog" in call_args
+
+    @pytest.mark.asyncio
+    async def test_synthesis_with_critical_warnings(self, tmp_path: Path) -> None:
+        """Test synthesis that produces critical warnings."""
+        project = tmp_path / "test.xpr"
+        project.touch()
+
+        mock_install = VivadoInstallation(
+            version="2023.2",
+            path=tmp_path / "Vivado" / "2023.2",
+            executable=tmp_path / "Vivado" / "2023.2" / "bin" / "vivado",
+        )
+
+        warning_output = (
+            b"CRITICAL WARNING: [Synth 8-5546] Missing constraint file\n"
+            b"Synthesis completed successfully\n"
+        )
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate = AsyncMock(return_value=(warning_output, b""))
+
+        with (
+            patch(
+                "vivado_mcp.vivado.build.get_default_vivado",
+                return_value=mock_install,
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                return_value=mock_process,
+            ),
+        ):
+            result = await run_synthesis(project)
+            assert result.success is True
+            assert len(result.errors) == 0
+            assert len(result.critical_warnings) == 1
+            assert result.critical_warnings[0].id == "Synth 8-5546"
