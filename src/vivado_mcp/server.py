@@ -22,6 +22,10 @@ from vivado_mcp.vivado.detection import (
     detect_vivado_installations,
     get_default_vivado,
 )
+from vivado_mcp.vivado.session import (
+    get_session_manager,
+    run_tcl_command_with_fallback,
+)
 
 # Create the MCP server instance
 server = Server("vivado-mcp")
@@ -158,6 +162,105 @@ async def list_tools() -> list[Tool]:
                 "required": ["project_path"],
             },
         ),
+        Tool(
+            name="start_tcl_session",
+            description=(
+                "Start a persistent Vivado TCL shell session. "
+                "Subsequent TCL commands can reuse this session, avoiding Vivado "
+                "startup overhead. The session remains active until explicitly closed. "
+                "Returns session ID and status information."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "vivado_version": {
+                        "type": "string",
+                        "description": (
+                            "Optional specific Vivado version to use (e.g., '2023.2'). "
+                            "If not provided, uses the auto-detected default installation."
+                        ),
+                    },
+                    "working_directory": {
+                        "type": "string",
+                        "description": (
+                            "Optional working directory for the session. "
+                            "Commands will execute relative to this directory."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="run_tcl_command",
+            description=(
+                "Execute a TCL command in a Vivado session. "
+                "If a persistent session is available, uses it for faster execution. "
+                "Otherwise falls back to batch mode. Supports any valid Vivado TCL command. "
+                "Returns command output, any errors, and execution time."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": (
+                            "The TCL command to execute (e.g., 'open_project myproj.xpr', "
+                            "'get_property STATUS [get_runs synth_1]', 'puts $::env(HOME)')."
+                        ),
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional session ID to use. If not provided, uses the default "
+                            "session or falls back to batch mode if no session is available."
+                        ),
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": (
+                            "Optional timeout in seconds for the command. "
+                            "Default is 300 seconds (5 minutes)."
+                        ),
+                    },
+                },
+                "required": ["command"],
+            },
+        ),
+        Tool(
+            name="close_tcl_session",
+            description=(
+                "Close a persistent Vivado TCL shell session. "
+                "Gracefully terminates the Vivado process. "
+                "If no session ID is provided, closes the default session."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional session ID to close. If not provided, "
+                            "closes the default session."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="list_tcl_sessions",
+            description=(
+                "List all active Vivado TCL shell sessions. "
+                "Returns information about each session including state, "
+                "Vivado version, start time, and command count."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -172,6 +275,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _handle_clean_build(arguments)
     if name == "get_build_status":
         return await _handle_get_build_status(arguments)
+    if name == "start_tcl_session":
+        return await _handle_start_tcl_session(arguments)
+    if name == "run_tcl_command":
+        return await _handle_run_tcl_command(arguments)
+    if name == "close_tcl_session":
+        return await _handle_close_tcl_session(arguments)
+    if name == "list_tcl_sessions":
+        return await _handle_list_tcl_sessions(arguments)
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -378,6 +489,153 @@ async def _handle_get_build_status(arguments: dict[str, Any]) -> Sequence[TextCo
     status = get_build_status(project_path=project_path)
 
     return [TextContent(type="text", text=json.dumps(status.to_dict(), indent=2))]
+
+
+async def _handle_start_tcl_session(arguments: dict[str, Any]) -> Sequence[TextContent]:
+    """Handle the start_tcl_session tool call.
+
+    Args:
+        arguments: Tool arguments containing optional 'vivado_version' and
+                  'working_directory' fields
+
+    Returns:
+        List of TextContent with session information
+    """
+    import json
+
+    vivado_version: str | None = arguments.get("vivado_version")
+    working_directory: str | None = arguments.get("working_directory")
+
+    # Get Vivado installation if version specified
+    vivado_install: VivadoInstallation | None = None
+    if vivado_version:
+        vivado_install = get_default_vivado(override_version=vivado_version)
+        if vivado_install is None:
+            result = {
+                "success": False,
+                "error": f"Requested Vivado version '{vivado_version}' not found",
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+    else:
+        # Use auto-detected installation
+        config = get_config()
+        if config.vivado_path:
+            vivado_install = get_default_vivado(override_path=config.vivado_path)
+        elif config.vivado_version:
+            vivado_install = get_default_vivado(override_version=config.vivado_version)
+
+    # Create and start the session
+    manager = get_session_manager()
+    session, success, message = await manager.create_session(
+        vivado_install=vivado_install,
+        working_directory=working_directory,
+    )
+
+    if success:
+        result = {
+            "success": True,
+            "message": message,
+            "session": session.get_info().to_dict(),
+        }
+    else:
+        result = {
+            "success": False,
+            "error": message,
+        }
+
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+async def _handle_run_tcl_command(arguments: dict[str, Any]) -> Sequence[TextContent]:
+    """Handle the run_tcl_command tool call.
+
+    Args:
+        arguments: Tool arguments containing 'command' and optional
+                  'session_id' and 'timeout' fields
+
+    Returns:
+        List of TextContent with command execution results
+    """
+    import json
+
+    command: str | None = arguments.get("command")
+    session_id: str | None = arguments.get("session_id")
+    timeout: float = arguments.get("timeout", 300.0)
+
+    # Validate required arguments
+    if not command:
+        result = {
+            "success": False,
+            "error": "Missing required argument: command",
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    # Get Vivado installation for batch fallback
+    config = get_config()
+    vivado_install: VivadoInstallation | None = None
+    if config.vivado_path:
+        vivado_install = get_default_vivado(override_path=config.vivado_path)
+    elif config.vivado_version:
+        vivado_install = get_default_vivado(override_version=config.vivado_version)
+
+    # Execute the command (with fallback to batch mode)
+    cmd_result = await run_tcl_command_with_fallback(
+        command=command,
+        session_id=session_id,
+        vivado_install=vivado_install,
+        timeout=timeout,
+    )
+
+    return [TextContent(type="text", text=json.dumps(cmd_result.to_dict(), indent=2))]
+
+
+async def _handle_close_tcl_session(arguments: dict[str, Any]) -> Sequence[TextContent]:
+    """Handle the close_tcl_session tool call.
+
+    Args:
+        arguments: Tool arguments containing optional 'session_id' field
+
+    Returns:
+        List of TextContent with close result
+    """
+    import json
+
+    session_id: str | None = arguments.get("session_id")
+
+    manager = get_session_manager()
+    success, message = await manager.close_session(session_id)
+
+    result = {
+        "success": success,
+        "message": message,
+    }
+
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+async def _handle_list_tcl_sessions(arguments: dict[str, Any]) -> Sequence[TextContent]:
+    """Handle the list_tcl_sessions tool call.
+
+    Args:
+        arguments: Tool arguments (currently unused)
+
+    Returns:
+        List of TextContent with session list
+    """
+    import json
+
+    _ = arguments  # Unused
+
+    manager = get_session_manager()
+    sessions = manager.list_sessions()
+
+    result = {
+        "sessions": [s.to_dict() for s in sessions],
+        "count": len(sessions),
+        "default_session_id": manager.default_session_id,
+    }
+
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
 async def run_server() -> None:
