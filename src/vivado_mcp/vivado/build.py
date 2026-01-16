@@ -203,12 +203,11 @@ def parse_vivado_output(output: str) -> tuple[list[BuildMessage], list[BuildMess
     return errors, critical_warnings
 
 
-def _generate_synthesis_tcl(project_path: Path, stop_on_error: bool = True) -> str:
+def _generate_synthesis_tcl(project_path: Path) -> str:
     """Generate TCL script for running synthesis only.
 
     Args:
         project_path: Path to the project (.xpr or .tcl)
-        stop_on_error: If True, stop the build on first error
 
     Returns:
         TCL script content as a string
@@ -218,11 +217,7 @@ def _generate_synthesis_tcl(project_path: Path, stop_on_error: bool = True) -> s
 
     tcl_lines = [
         "# Auto-generated synthesis script for vivado-mcp",
-        "# Stop on first error if requested",
     ]
-
-    if stop_on_error:
-        tcl_lines.append("set_msg_config -severity ERROR -stop true")
 
     if is_xpr:
         # For .xpr files, open the project and run synthesis only
@@ -263,12 +258,11 @@ def _generate_synthesis_tcl(project_path: Path, stop_on_error: bool = True) -> s
     return "\n".join(tcl_lines)
 
 
-def _generate_implementation_tcl(project_path: Path, stop_on_error: bool = True) -> str:
+def _generate_implementation_tcl(project_path: Path) -> str:
     """Generate TCL script for running implementation only (after synthesis).
 
     Args:
         project_path: Path to the project (.xpr or .tcl)
-        stop_on_error: If True, stop the build on first error
 
     Returns:
         TCL script content as a string
@@ -278,11 +272,7 @@ def _generate_implementation_tcl(project_path: Path, stop_on_error: bool = True)
 
     tcl_lines = [
         "# Auto-generated implementation script for vivado-mcp",
-        "# Stop on first error if requested",
     ]
-
-    if stop_on_error:
-        tcl_lines.append("set_msg_config -severity ERROR -stop true")
 
     if is_xpr:
         # For .xpr files, open the project and run implementation only
@@ -339,12 +329,11 @@ def _generate_implementation_tcl(project_path: Path, stop_on_error: bool = True)
     return "\n".join(tcl_lines)
 
 
-def _generate_bitstream_tcl(project_path: Path, stop_on_error: bool = True) -> str:
+def _generate_bitstream_tcl(project_path: Path) -> str:
     """Generate TCL script for generating bitstream only (after implementation).
 
     Args:
         project_path: Path to the project (.xpr or .tcl)
-        stop_on_error: If True, stop the build on first error
 
     Returns:
         TCL script content as a string
@@ -354,11 +343,7 @@ def _generate_bitstream_tcl(project_path: Path, stop_on_error: bool = True) -> s
 
     tcl_lines = [
         "# Auto-generated bitstream script for vivado-mcp",
-        "# Stop on first error if requested",
     ]
-
-    if stop_on_error:
-        tcl_lines.append("set_msg_config -severity ERROR -stop true")
 
     if is_xpr:
         # For .xpr files, open the project and generate bitstream only
@@ -414,12 +399,11 @@ def _generate_bitstream_tcl(project_path: Path, stop_on_error: bool = True) -> s
     return "\n".join(tcl_lines)
 
 
-def _generate_build_tcl(project_path: Path, stop_on_error: bool = True) -> str:
+def _generate_build_tcl(project_path: Path) -> str:
     """Generate TCL script for running a full build.
 
     Args:
         project_path: Path to the project (.xpr or .tcl)
-        stop_on_error: If True, stop the build on first error
 
     Returns:
         TCL script content as a string
@@ -429,11 +413,7 @@ def _generate_build_tcl(project_path: Path, stop_on_error: bool = True) -> str:
 
     tcl_lines = [
         "# Auto-generated build script for vivado-mcp",
-        "# Stop on first error if requested",
     ]
-
-    if stop_on_error:
-        tcl_lines.append("set_msg_config -severity ERROR -stop true")
 
     if is_xpr:
         # For .xpr files, open the project

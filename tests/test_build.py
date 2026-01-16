@@ -207,7 +207,6 @@ class TestGenerateBuildTcl:
         assert "impl_1" in tcl
         assert "write_bitstream" in tcl
         assert "batch" not in tcl  # batch is in command line, not TCL
-        assert "set_msg_config -severity ERROR -stop true" in tcl
 
     def test_tcl_project(self, tmp_path: Path) -> None:
         project = tmp_path / "build.tcl"
@@ -220,11 +219,6 @@ class TestGenerateBuildTcl:
         assert "place_design" in tcl
         assert "route_design" in tcl
         assert "write_bitstream" in tcl
-
-    def test_stop_on_error_disabled(self, tmp_path: Path) -> None:
-        project = tmp_path / "test.xpr"
-        tcl = _generate_build_tcl(project, stop_on_error=False)
-        assert "set_msg_config -severity ERROR -stop true" not in tcl
 
 
 class TestRunVivadoBuild:
@@ -785,7 +779,6 @@ class TestGenerateSynthesisTcl:
         assert "open_project" in tcl
         assert "synth_1" in tcl
         assert "Synthesis completed successfully" in tcl
-        assert "set_msg_config -severity ERROR -stop true" in tcl
 
         # Verify implementation commands are NOT present
         assert "impl_1" not in tcl
@@ -808,11 +801,6 @@ class TestGenerateSynthesisTcl:
         assert "place_design" not in tcl
         assert "route_design" not in tcl
         assert "write_bitstream" not in tcl
-
-    def test_stop_on_error_disabled(self, tmp_path: Path) -> None:
-        project = tmp_path / "test.xpr"
-        tcl = _generate_synthesis_tcl(project, stop_on_error=False)
-        assert "set_msg_config -severity ERROR -stop true" not in tcl
 
 
 class TestRunSynthesis:
@@ -1070,7 +1058,6 @@ class TestGenerateImplementationTcl:
         assert "open_project" in tcl
         assert "impl_1" in tcl
         assert "Implementation completed successfully" in tcl
-        assert "set_msg_config -severity ERROR -stop true" in tcl
         assert "write_bitstream" in tcl
 
         # Verify synthesis check is present (to require completed synthesis)
@@ -1095,11 +1082,6 @@ class TestGenerateImplementationTcl:
 
         # Verify synthesis commands are NOT present
         assert "synth_design" not in tcl
-
-    def test_stop_on_error_disabled(self, tmp_path: Path) -> None:
-        project = tmp_path / "test.xpr"
-        tcl = _generate_implementation_tcl(project, stop_on_error=False)
-        assert "set_msg_config -severity ERROR -stop true" not in tcl
 
 
 class TestRunImplementation:
@@ -1562,7 +1544,6 @@ class TestGenerateBitstreamTcl:
         assert "impl_1" in tcl
         assert "write_bitstream" in tcl
         assert "Bitstream generation completed successfully" in tcl
-        assert "set_msg_config -severity ERROR -stop true" in tcl
         assert "BITSTREAM_FILE:" in tcl
 
         # Verify implementation check is present (to require completed implementation)
@@ -1591,11 +1572,6 @@ class TestGenerateBitstreamTcl:
         assert "opt_design" not in tcl
         assert "place_design" not in tcl
         assert "route_design" not in tcl
-
-    def test_stop_on_error_disabled(self, tmp_path: Path) -> None:
-        project = tmp_path / "test.xpr"
-        tcl = _generate_bitstream_tcl(project, stop_on_error=False)
-        assert "set_msg_config -severity ERROR -stop true" not in tcl
 
 
 class TestRunBitstreamGeneration:
