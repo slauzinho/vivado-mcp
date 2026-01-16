@@ -15,7 +15,12 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from vivado_mcp.config import VivadoConfig
-from vivado_mcp.vivado.build import get_build_status, run_synthesis, run_vivado_build
+from vivado_mcp.vivado.build import (
+    get_build_status,
+    run_implementation,
+    run_synthesis,
+    run_vivado_build,
+)
 from vivado_mcp.vivado.clean import clean_build_outputs
 from vivado_mcp.vivado.detection import (
     VivadoInstallation,
@@ -149,6 +154,46 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Optional timeout in seconds for the synthesis process. "
                             "If not provided, synthesis runs until completion or error."
+                        ),
+                    },
+                },
+                "required": ["project_path"],
+            },
+        ),
+        Tool(
+            name="run_implementation",
+            description=(
+                "Run Vivado implementation only (after synthesis is complete). "
+                "Allows testing place and route without regenerating synthesis. "
+                "Requires completed synthesis before running. "
+                "Executes Vivado in batch mode with no GUI. "
+                "The implementation stops immediately on the first error. "
+                "Returns success/failure status with any errors or critical warnings. "
+                "Uses auto-detected Vivado installation unless a specific version is requested."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": (
+                            "Path to the Vivado project file (.xpr) or TCL build script (.tcl). "
+                            "For .xpr files, requires synth_1 to be complete before running. "
+                            "For .tcl files, sources the script and runs implementation steps."
+                        ),
+                    },
+                    "vivado_version": {
+                        "type": "string",
+                        "description": (
+                            "Optional specific Vivado version to use (e.g., '2023.2'). "
+                            "If not provided, uses the auto-detected default installation."
+                        ),
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": (
+                            "Optional timeout in seconds for the implementation process. "
+                            "If not provided, implementation runs until completion or error."
                         ),
                     },
                 },
@@ -312,6 +357,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _handle_run_build(arguments)
     if name == "run_synthesis":
         return await _handle_run_synthesis(arguments)
+    if name == "run_implementation":
+        return await _handle_run_implementation(arguments)
     if name == "clean_build":
         return await _handle_clean_build(arguments)
     if name == "get_build_status":
@@ -531,6 +578,60 @@ async def _handle_run_synthesis(arguments: dict[str, Any]) -> Sequence[TextConte
     )
 
     return [TextContent(type="text", text=json.dumps(synth_result.to_dict(), indent=2))]
+
+
+async def _handle_run_implementation(arguments: dict[str, Any]) -> Sequence[TextContent]:
+    """Handle the run_implementation tool call.
+
+    Args:
+        arguments: Tool arguments containing 'project_path' and optional
+                  'vivado_version' and 'timeout' fields
+
+    Returns:
+        List of TextContent with implementation results
+    """
+    import json
+
+    project_path: str | None = arguments.get("project_path")
+    vivado_version: str | None = arguments.get("vivado_version")
+    timeout: int | None = arguments.get("timeout")
+
+    # Validate required arguments
+    if not project_path:
+        result = {
+            "success": False,
+            "error": "Missing required argument: project_path",
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    # Get Vivado installation
+    vivado_install: VivadoInstallation | None = None
+    if vivado_version:
+        vivado_install = get_default_vivado(override_version=vivado_version)
+        if vivado_install is None:
+            result = {
+                "success": False,
+                "error": f"Requested Vivado version '{vivado_version}' not found",
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+    else:
+        # Use auto-detected installation
+        config = get_config()
+        if config.vivado_path:
+            vivado_install = get_default_vivado(override_path=config.vivado_path)
+        elif config.vivado_version:
+            vivado_install = get_default_vivado(override_version=config.vivado_version)
+        else:
+            vivado_install = get_default_vivado()
+
+    # Run implementation only
+    impl_result = await run_implementation(
+        project_path=project_path,
+        vivado_install=vivado_install,
+        timeout=timeout,
+    )
+
+    return [TextContent(type="text", text=json.dumps(impl_result.to_dict(), indent=2))]
 
 
 async def _handle_clean_build(arguments: dict[str, Any]) -> Sequence[TextContent]:
